@@ -152,4 +152,36 @@ def prepare_dataset(base_dir="datasets/bird_dataset", sample_ratio=1.0, random_s
         random_seed (int): Random seed for reproducibility
     """
     processor = BirdDatasetProcessor(base_dir, sample_ratio, random_seed)
-    return processor.process_dataset() 
+    return processor.process_dataset()
+
+def get_dataset_labels(dataset_name):
+    """Get class labels for a specific dataset
+    Args:
+        dataset_name (str): Name of the dataset ('cifar10', 'birdsnap', etc.)
+    Returns:
+        list: List of class names
+    """
+    # Check if there's a yaml file for the dataset
+    yaml_path = os.path.join('datasets', f'{dataset_name}.yaml')
+    if os.path.exists(yaml_path):
+        with open(yaml_path, 'r') as f:
+            dataset_info = yaml.safe_load(f)
+            if dataset_info and 'names' in dataset_info:
+                return dataset_info['names']
+    
+    # Fallback to default class names for known datasets
+    if dataset_name == 'cifar10':
+        return [
+            'airplane', 'automobile', 'bird', 'cat', 'deer',
+            'dog', 'frog', 'horse', 'ship', 'truck'
+        ]
+    elif dataset_name == 'birdsnap':
+        # Try loading from the dataset directly
+        try:
+            dataset = load_dataset("sasha/birdsnap")
+            return dataset['train'].features['label'].names
+        except Exception as e:
+            print(f"Error loading BirdSnap class names: {e}")
+            return None
+    
+    return None 
