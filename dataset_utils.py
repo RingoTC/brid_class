@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 class BirdDatasetProcessor:
-    def __init__(self, base_dir="bird_dataset", sample_ratio=1.0, random_seed=42):
+    def __init__(self, base_dir="datasets/bird_dataset", sample_ratio=1.0, random_seed=42):
         """
         Initialize the dataset processor
         Args:
@@ -18,13 +18,15 @@ class BirdDatasetProcessor:
         """
         self.base_dir = base_dir
         self.dataset = None
-        self.yaml_path = 'dataset.yaml'
+        self.yaml_path = os.path.join('datasets', 'dataset.yaml')
         self.sample_ratio = max(0.0, min(1.0, sample_ratio))  # Clamp between 0 and 1
         self.random_seed = random_seed
         
     def download_dataset(self):
         """Download the birdsnap dataset"""
         print("Downloading dataset...")
+        # Set HuggingFace cache directory to local datasets folder
+        os.environ['HF_HOME'] = os.path.join(os.getcwd(), 'datasets', '.cache')
         self.dataset = load_dataset("sasha/birdsnap")
         return self.dataset
     
@@ -142,7 +144,7 @@ class BirdDatasetProcessor:
         with open(self.yaml_path, 'r') as f:
             return yaml.safe_load(f)
 
-def prepare_dataset(base_dir="bird_dataset", sample_ratio=1.0, random_seed=42):
+def prepare_dataset(base_dir="datasets/bird_dataset", sample_ratio=1.0, random_seed=42):
     """Helper function to prepare the dataset
     Args:
         base_dir (str): Directory to store the processed dataset

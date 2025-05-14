@@ -83,13 +83,7 @@ class BirdClassifierWindow(QMainWindow):
             if dataset_info:
                 self.class_names = dataset_info['names']
             else:
-                # Fallback to downloading class names
-                import requests
-                url = "https://huggingface.co/datasets/sasha/birdsnap/resolve/main/species.txt"
-                response = requests.get(url)
-                lines = response.text.split('\n')
-                self.class_names = [line.split()[1].replace('_', ' ').title() 
-                                  for line in lines if line.strip()]
+                raise Exception("No dataset information found")
         except Exception as e:
             print(f"Error loading class names: {e}")
             self.class_names = [f"Class {i}" for i in range(500)]  # Fallback

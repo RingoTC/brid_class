@@ -1,6 +1,5 @@
 import torch
 from transformers import ViTImageProcessor, ViTForImageClassification
-from dataset_utils import BirdDatasetProcessor
 import os
 from tqdm import tqdm
 import numpy as np
@@ -11,29 +10,30 @@ from utils import get_device
 import pandas as pd
 from datetime import datetime
 from PIL import Image
+import yaml
+import argparse
 
-def load_model(model_path=None):
-    """Load a ViT model
-    If model_path is None, loads the base model for zero-shot evaluation
-    """
-    if model_path is None:
-        # Load base model for zero-shot
-        model_name = "google/vit-base-patch16-224"
-        model = ViTForImageClassification.from_pretrained(model_name, num_labels=500)
-        processor = ViTImageProcessor.from_pretrained(model_name)
-    else:
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model weights not found at {model_path}")
-        model = ViTForImageClassification.from_pretrained(model_path)
-        processor = ViTImageProcessor.from_pretrained(model_path)
-    
+def load_model(model_path):
+    """Load a fine-tuned ViT model"""
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model weights not found at {model_path}")
+    model = ViTForImageClassification.from_pretrained(model_path)
+    processor = ViTImageProcessor.from_pretrained(model_path)
     return model, processor
 
-def evaluate_model(model, processor, dataset_yaml='dataset.yaml', split='test', model_type="fine-tuned"):
+def get_dataset_info(dataset_name):
+    """Get dataset information from yaml file"""
+    yaml_path = os.path.join('datasets', dataset_name, 'dataset.yaml')
+    if not os.path.exists(yaml_path):
+        raise ValueError(f"Dataset configuration not found at {yaml_path}")
+    
+    with open(yaml_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def evaluate_model(model, processor, dataset_name, split='test'):
     """Evaluate the model on the specified split"""
     # Load dataset info
-    data_processor = BirdDatasetProcessor()
-    dataset_info = data_processor.get_dataset_info()
+    dataset_info = get_dataset_info(dataset_name)
     
     if dataset_info is None:
         raise ValueError("Dataset information not found. Please run training first.")
@@ -59,7 +59,7 @@ def evaluate_model(model, processor, dataset_yaml='dataset.yaml', split='test', 
     # Process images in batches
     batch_size = 32
     
-    print(f"Evaluating {model_type} model on {split} set...")
+    print(f"\nEvaluating model on {dataset_name} {split} set...")
     
     with torch.no_grad():
         for i in tqdm(range(0, len(test_images), batch_size)):
@@ -134,7 +134,7 @@ def evaluate_model(model, processor, dataset_yaml='dataset.yaml', split='test', 
     metrics['classification_report'] = report
     
     # Print results
-    print(f"\n{model_type} Model Evaluation Results:")
+    print(f"\nModel Evaluation Results on {dataset_name}:")
     print(f"Overall Accuracy: {metrics['accuracy']:.4f}")
     print(f"Macro F1-Score: {metrics['f1_macro']:.4f}")
     if metrics['roc_auc'] is not None:
@@ -146,7 +146,7 @@ def evaluate_model(model, processor, dataset_yaml='dataset.yaml', split='test', 
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=class_names,
                 yticklabels=class_names)
-    plt.title(f'Confusion Matrix - {model_type} Model')
+    plt.title(f'Confusion Matrix - {dataset_name}')
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.xticks(rotation=90)
@@ -154,12 +154,12 @@ def evaluate_model(model, processor, dataset_yaml='dataset.yaml', split='test', 
     plt.tight_layout()
     
     # Create results directory if it doesn't exist
-    results_dir = 'evaluation_results'
+    results_dir = os.path.join('evaluation_results', dataset_name)
     os.makedirs(results_dir, exist_ok=True)
     
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_prefix = f"{results_dir}/{model_type}_{split}_{timestamp}"
+    results_prefix = f"{results_dir}/{split}_{timestamp}"
     
     # Save confusion matrix
     plt.savefig(f"{results_prefix}_confusion_matrix.png")
@@ -187,60 +187,31 @@ def evaluate_model(model, processor, dataset_yaml='dataset.yaml', split='test', 
     
     return metrics
 
-def compare_models(fine_tuned_path):
-    """Compare zero-shot and fine-tuned model performance"""
-    # Load both models
-    zero_shot_model, zero_shot_processor = load_model()
-    fine_tuned_model, fine_tuned_processor = load_model(fine_tuned_path)
+def main():
+    parser = argparse.ArgumentParser(description='Evaluate image classification model')
+    parser.add_argument('--dataset', type=str, default='birdsnap',
+                      help='Dataset to evaluate on (birdsnap, cifar10, cifar100)')
+    parser.add_argument('--model-path', type=str, default=None,
+                      help='Path to the fine-tuned model')
+    parser.add_argument('--split', type=str, default='test',
+                      help='Dataset split to evaluate on (train, val, test)')
     
-    # Evaluate on test set
-    print("\nEvaluating Zero-shot Performance...")
-    zero_shot_metrics = evaluate_model(
-        zero_shot_model, 
-        zero_shot_processor,
-        split='test',
-        model_type="zero-shot"
+    args = parser.parse_args()
+    
+    # Set default model path if not provided
+    if args.model_path is None:
+        args.model_path = f"models/{args.dataset}/best"
+    
+    # Load model
+    model, processor = load_model(args.model_path)
+    
+    # Evaluate model
+    metrics = evaluate_model(
+        model=model,
+        processor=processor,
+        dataset_name=args.dataset,
+        split=args.split
     )
-    
-    print("\nEvaluating Fine-tuned Performance...")
-    fine_tuned_metrics = evaluate_model(
-        fine_tuned_model,
-        fine_tuned_processor,
-        split='test',
-        model_type="fine-tuned"
-    )
-    
-    # Create comparison plots
-    metrics_comparison = pd.DataFrame({
-        'Metric': ['Accuracy', 'Macro F1-Score', 'ROC-AUC'],
-        'Zero-shot': [
-            zero_shot_metrics['accuracy'],
-            zero_shot_metrics['f1_macro'],
-            zero_shot_metrics['roc_auc'] if zero_shot_metrics['roc_auc'] is not None else 0
-        ],
-        'Fine-tuned': [
-            fine_tuned_metrics['accuracy'],
-            fine_tuned_metrics['f1_macro'],
-            fine_tuned_metrics['roc_auc'] if fine_tuned_metrics['roc_auc'] is not None else 0
-        ]
-    })
-    
-    # Plot comparison
-    plt.figure(figsize=(10, 6))
-    metrics_comparison.plot(x='Metric', y=['Zero-shot', 'Fine-tuned'], kind='bar')
-    plt.title('Zero-shot vs Fine-tuned Performance')
-    plt.ylabel('Score')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig('evaluation_results/model_comparison.png')
-    plt.close()
-    
-    # Save comparison to CSV
-    metrics_comparison.to_csv('evaluation_results/model_comparison.csv', index=False)
-    
-    return zero_shot_metrics, fine_tuned_metrics
 
 if __name__ == "__main__":
-    # Load and compare models
-    fine_tuned_path = "models/finetuned/best"
-    zero_shot_metrics, fine_tuned_metrics = compare_models(fine_tuned_path) 
+    main() 
