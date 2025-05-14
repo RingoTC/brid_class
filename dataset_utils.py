@@ -29,7 +29,7 @@ class BirdDatasetProcessor:
         return self.dataset
     
     def setup_directories(self):
-        """Create necessary directories for YOLO format"""
+        """Create necessary directories for dataset"""
         for split in ['train', 'val', 'test']:
             os.makedirs(os.path.join(self.base_dir, split, 'images'), exist_ok=True)
             os.makedirs(os.path.join(self.base_dir, split, 'labels'), exist_ok=True)
@@ -74,7 +74,7 @@ class BirdDatasetProcessor:
         return splits
     
     def create_yaml(self):
-        """Create dataset.yaml file"""
+        """Create dataset.yaml file with dataset information"""
         if self.dataset is None:
             self.download_dataset()
             
@@ -93,7 +93,7 @@ class BirdDatasetProcessor:
         return yaml_content
     
     def process_dataset(self):
-        """Process and save the dataset in YOLO format"""
+        """Process and save the dataset"""
         self.setup_directories()
         splits = self.create_splits()
         yaml_content = self.create_yaml()
@@ -111,16 +111,16 @@ class BirdDatasetProcessor:
                 image_path = os.path.join(self.base_dir, split_name, 'images', f"{idx}.jpg")
                 image.save(image_path)
                 
-                # Create YOLO format label
+                # Save label
                 label = sample['label']
                 label_path = os.path.join(self.base_dir, split_name, 'labels', f"{idx}.txt")
                 
                 # Update class distribution
                 class_counts[split_name][label] = class_counts[split_name].get(label, 0) + 1
                 
-                # YOLO format: class_id x_center y_center width height
+                # Save label as a simple number (class index)
                 with open(label_path, 'w') as f:
-                    f.write(f"{label} 0.5 0.5 1.0 1.0\n")
+                    f.write(f"{label}\n")
         
         # Print class distribution summary
         print("\nClass distribution summary:")

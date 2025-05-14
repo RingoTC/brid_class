@@ -1,5 +1,5 @@
 import torch
-from ultralytics import YOLO
+from transformers import ViTImageProcessor, ViTForImageClassification
 from dataset_utils import BirdDatasetProcessor
 import os
 from tqdm import tqdm
@@ -10,31 +10,38 @@ import matplotlib.pyplot as plt
 from utils import get_device
 import pandas as pd
 from datetime import datetime
+from PIL import Image
 
-def load_model(weights_path=None):
-    """Load a YOLO model
-    If weights_path is None, loads the base model for zero-shot evaluation
+def load_model(model_path=None):
+    """Load a ViT model
+    If model_path is None, loads the base model for zero-shot evaluation
     """
-    if weights_path is None:
+    if model_path is None:
         # Load base model for zero-shot
-        model = YOLO('yolov8n.pt')
+        model_name = "google/vit-base-patch16-224"
+        model = ViTForImageClassification.from_pretrained(model_name, num_labels=500)
+        processor = ViTImageProcessor.from_pretrained(model_name)
     else:
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"Model weights not found at {weights_path}")
-        model = YOLO(weights_path)
-    return model
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model weights not found at {model_path}")
+        model = ViTForImageClassification.from_pretrained(model_path)
+        processor = ViTImageProcessor.from_pretrained(model_path)
+    
+    return model, processor
 
-def evaluate_model(model, dataset_yaml='dataset.yaml', split='test', model_type="fine-tuned"):
+def evaluate_model(model, processor, dataset_yaml='dataset.yaml', split='test', model_type="fine-tuned"):
     """Evaluate the model on the specified split"""
     # Load dataset info
-    processor = BirdDatasetProcessor()
-    dataset_info = processor.get_dataset_info()
+    data_processor = BirdDatasetProcessor()
+    dataset_info = data_processor.get_dataset_info()
     
     if dataset_info is None:
         raise ValueError("Dataset information not found. Please run training first.")
     
     # Configure device
     device = get_device()
+    model.to(device)
+    model.eval()
     
     # Get test images directory
     test_dir = dataset_info[split]
@@ -44,45 +51,53 @@ def evaluate_model(model, dataset_yaml='dataset.yaml', split='test', model_type=
     # Prepare for evaluation
     all_predictions = []
     all_targets = []
-    all_pred_probs = []  # Store prediction probabilities for ROC-AUC
+    all_pred_probs = []
     
     # Get all test images
     test_images = [f for f in os.listdir(test_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
     
-    # Adjust batch size based on available memory
-    batch_size = 16
-    if device.type == "cuda":
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # in GB
-        if gpu_memory >= 16:
-            batch_size = 32
-        elif gpu_memory >= 8:
-            batch_size = 24
-    
-    print(f"Evaluating {model_type} model on {split} set with batch size: {batch_size}...")
-    
     # Process images in batches
-    for i in tqdm(range(0, len(test_images), batch_size)):
-        batch_images = test_images[i:i + batch_size]
-        batch_paths = [os.path.join(test_dir, img) for img in batch_images]
-        
-        # Get predictions for batch
-        results = model.predict(batch_paths, device=device)
-        
-        # Process each result in the batch
-        for j, img_name in enumerate(batch_images):
-            # Get true label
-            label_path = os.path.join(os.path.dirname(test_dir), 'labels',
-                                    os.path.splitext(img_name)[0] + '.txt')
-            with open(label_path, 'r') as f:
-                true_label = int(f.read().split()[0])
+    batch_size = 32
+    
+    print(f"Evaluating {model_type} model on {split} set...")
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, len(test_images), batch_size)):
+            batch_images = test_images[i:i + batch_size]
+            batch_inputs = []
+            batch_labels = []
             
-            # Get prediction and probabilities
-            pred_label = results[j].probs.top1
-            pred_probs = results[j].probs.data.cpu().numpy()
+            for img_name in batch_images:
+                # Load and preprocess image
+                image_path = os.path.join(test_dir, img_name)
+                image = Image.open(image_path).convert('RGB')
+                inputs = processor(images=image, return_tensors="pt")
+                batch_inputs.append({k: v.to(device) for k, v in inputs.items()})
+                
+                # Get true label
+                label_path = os.path.join(os.path.dirname(test_dir), 'labels',
+                                        os.path.splitext(img_name)[0] + '.txt')
+                with open(label_path, 'r') as f:
+                    true_label = int(f.read().split()[0])
+                batch_labels.append(true_label)
             
-            all_predictions.append(pred_label)
-            all_targets.append(true_label)
-            all_pred_probs.append(pred_probs)
+            # Stack batch inputs
+            batch_input_dict = {
+                k: torch.cat([inputs[k] for inputs in batch_inputs]) 
+                for k in batch_inputs[0].keys()
+            }
+            
+            # Get predictions
+            outputs = model(**batch_input_dict)
+            logits = outputs.logits
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            
+            # Get predictions and probabilities
+            preds = torch.argmax(logits, dim=-1)
+            
+            all_predictions.extend(preds.cpu().numpy())
+            all_targets.extend(batch_labels)
+            all_pred_probs.extend(probs.cpu().numpy())
     
     # Convert to numpy arrays
     all_predictions = np.array(all_predictions)
@@ -103,7 +118,7 @@ def evaluate_model(model, dataset_yaml='dataset.yaml', split='test', model_type=
     # ROC-AUC score (one-vs-rest)
     try:
         metrics['roc_auc'] = roc_auc_score(
-            np.eye(n_classes)[all_targets],  # Convert to one-hot encoding
+            np.eye(n_classes)[all_targets],
             all_pred_probs,
             multi_class='ovr',
             average='macro'
@@ -175,15 +190,25 @@ def evaluate_model(model, dataset_yaml='dataset.yaml', split='test', model_type=
 def compare_models(fine_tuned_path):
     """Compare zero-shot and fine-tuned model performance"""
     # Load both models
-    zero_shot_model = load_model()
-    fine_tuned_model = load_model(fine_tuned_path)
+    zero_shot_model, zero_shot_processor = load_model()
+    fine_tuned_model, fine_tuned_processor = load_model(fine_tuned_path)
     
     # Evaluate on test set
     print("\nEvaluating Zero-shot Performance...")
-    zero_shot_metrics = evaluate_model(zero_shot_model, split='test', model_type="zero-shot")
+    zero_shot_metrics = evaluate_model(
+        zero_shot_model, 
+        zero_shot_processor,
+        split='test',
+        model_type="zero-shot"
+    )
     
     print("\nEvaluating Fine-tuned Performance...")
-    fine_tuned_metrics = evaluate_model(fine_tuned_model, split='test', model_type="fine-tuned")
+    fine_tuned_metrics = evaluate_model(
+        fine_tuned_model,
+        fine_tuned_processor,
+        split='test',
+        model_type="fine-tuned"
+    )
     
     # Create comparison plots
     metrics_comparison = pd.DataFrame({
@@ -217,5 +242,5 @@ def compare_models(fine_tuned_path):
 
 if __name__ == "__main__":
     # Load and compare models
-    fine_tuned_path = "bird_classification/train/weights/best.pt"
+    fine_tuned_path = "models/finetuned/best"
     zero_shot_metrics, fine_tuned_metrics = compare_models(fine_tuned_path) 
