@@ -1,194 +1,55 @@
 import os
-import torch
-from datasets import load_dataset
-from PIL import Image
 import yaml
-from tqdm import tqdm
-import shutil
-from pathlib import Path
-from dataset_utils import prepare_dataset
-from utils import get_device
+import datetime
 import argparse
+import numpy as np
+import torch
+import shutil
+from sklearn.metrics import roc_auc_score
 from transformers import (
-    ViTImageProcessor,
+    ViTImageProcessor, 
     ViTForImageClassification,
     TrainingArguments,
-    Trainer
+    Trainer,
+    EarlyStoppingCallback
 )
-from torch.utils.data import Dataset
-import numpy as np
+from utils import get_device
+from dataset import load_dataset, ImageClassificationDataset
 
-class ImageClassificationDataset(Dataset):
-    def __init__(self, image_paths, labels, processor):
-        self.image_paths = image_paths
-        self.labels = labels
-        self.processor = processor
 
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert('RGB')
-        inputs = self.processor(images=image, return_tensors="pt")
-        # Remove batch dimension
-        for k, v in inputs.items():
-            inputs[k] = v.squeeze(0)
-        inputs['labels'] = self.labels[idx]
-        return inputs
-
-def setup_dataset(dataset_name, base_dir="datasets", train_ratio=0.7, val_ratio=0.15, sample_ratio=1.0):
-    """Setup dataset and return paths and labels for each split"""
-    dataset_dir = os.path.join(base_dir, dataset_name)
-    yaml_path = os.path.join(dataset_dir, 'dataset.yaml')
+def train_model(dataset_info, model_name="google/vit-base-patch16-224",
+                num_epochs=100, batch_size=32, learning_rate=2e-5, output_dir=None,
+                kfold_config=None, fold_idx=None, patience=3):
+    """Train the ViT model
     
-    # If dataset already exists, load it directly
-    if os.path.exists(yaml_path):
-        print(f"Found existing {dataset_name} dataset, loading directly...")
-        with open(yaml_path, 'r') as f:
-            yaml_content = yaml.safe_load(f)
+    Args:
+        split_data: Dictionary with split data
+        yaml_content: Dataset metadata
+        model_name: Name of the pretrained model to use
+        num_epochs: Number of training epochs
+        batch_size: Batch size for training
+        learning_rate: Learning rate for training
+        output_dir: Output directory for saving models
+        kfold_config: K-fold configuration
+        fold_idx: Current fold index (0-based)
         
-        split_data = {}
-        for split_name in ['train', 'val', 'test']:
-            split_dir = os.path.join(dataset_dir, split_name)
-            image_paths = sorted([
-                os.path.join(split_dir, 'images', f) 
-                for f in os.listdir(os.path.join(split_dir, 'images'))
-                if f.endswith('.jpg')
-            ])
-            
-            # Apply sample ratio to each split
-            if sample_ratio < 1.0:
-                num_samples = int(len(image_paths) * sample_ratio)
-                image_paths = image_paths[:num_samples]
-            
-            labels = []
-            for img_path in image_paths:
-                idx = os.path.basename(img_path).split('.')[0]
-                label_path = os.path.join(split_dir, 'labels', f"{idx}.txt")
-                with open(label_path, 'r') as f:
-                    labels.append(int(f.read().strip()))
-            
-            split_data[split_name] = {
-                'image_paths': image_paths,
-                'labels': labels
-            }
-        
-        return yaml_content, split_data
-
-    # Dataset specific configurations
-    dataset_configs = {
-        'birdsnap': {
-            'path': "sasha/birdsnap",
-            'split_key': 'train',
-            'image_key': 'image',
-            'label_key': 'label'
-        },
-        'cifar10': {
-            'path': "cifar10",
-            'split_key': 'train',
-            'image_key': 'img',
-            'label_key': 'label'
-        },
-        'cifar100': {
-            'path': "cifar100",
-            'split_key': 'train',
-            'image_key': 'img',
-            'label_key': 'fine_label'
-        }
-    }
-    
-    if dataset_name not in dataset_configs:
-        raise ValueError(f"Dataset {dataset_name} not supported. Available datasets: {list(dataset_configs.keys())}")
-    
-    config = dataset_configs[dataset_name]
-    
-    # Load the dataset
-    print(f"Loading {dataset_name} dataset...")
-    dataset = load_dataset(config['path'])
-    
-    # Create directories
-    for split in ['train', 'val', 'test']:
-        os.makedirs(os.path.join(dataset_dir, split, 'images'), exist_ok=True)
-        os.makedirs(os.path.join(dataset_dir, split, 'labels'), exist_ok=True)
-
-    # Process the dataset
-    total_size = len(dataset[config['split_key']])
-    train_size = int(total_size * train_ratio)
-    val_size = int(total_size * val_ratio)
-    
-    # Create splits
-    indices = torch.randperm(total_size).tolist()
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
-
-    # Save dataset info
-    classes = dataset[config['split_key']].features[config['label_key']].names
-    yaml_content = {
-        'dataset_name': dataset_name,
-        'train': os.path.join(os.getcwd(), dataset_dir, 'train', 'images'),
-        'val': os.path.join(os.getcwd(), dataset_dir, 'val', 'images'),
-        'test': os.path.join(os.getcwd(), dataset_dir, 'test', 'images'),
-        'nc': len(classes),
-        'names': classes
-    }
-
-    with open(yaml_path, 'w') as f:
-        yaml.dump(yaml_content, f)
-
-    # Process and save images
-    splits = {
-        'train': train_indices,
-        'val': val_indices,
-        'test': test_indices
-    }
-
-    split_data = {}
-    for split_name, indices in splits.items():
-        print(f"Processing {split_name} split...")
-        image_paths = []
-        labels = []
-        
-        for idx in tqdm(indices):
-            sample = dataset[config['split_key']][idx]
-            
-            # Save image
-            image = sample[config['image_key']]
-            if not isinstance(image, Image.Image):
-                image = Image.fromarray(image)
-            
-            image_path = os.path.join(dataset_dir, split_name, 'images', f"{idx}.jpg")
-            image.save(image_path)
-            
-            # Save label
-            label = sample[config['label_key']]
-            label_path = os.path.join(dataset_dir, split_name, 'labels', f"{idx}.txt")
-            
-            with open(label_path, 'w') as f:
-                f.write(f"{label}\n")
-            
-            image_paths.append(image_path)
-            labels.append(label)
-            
-        split_data[split_name] = {
-            'image_paths': image_paths,
-            'labels': labels
-        }
-
-    return yaml_content, split_data
-
-def train_model(split_data, yaml_content, model_name="google/vit-base-patch16-224", 
-                num_epochs=100, batch_size=32, learning_rate=2e-5, output_dir=None):
-    """Train the ViT model"""
+    Returns:
+        model: Trained model
+        processor: Image processor
+    """
     device = get_device()
     
-    # Get number of classes from yaml_content
-    num_classes = yaml_content['nc']
-    dataset_name = yaml_content['dataset_name']
-    print(f"\nNumber of classes in {dataset_name} dataset: {num_classes}")
+    # Get dataset info
+    num_classes = dataset_info['num_classes']
+    class_names = dataset_info['class_names']
     
-    if output_dir is None:
-        output_dir = f"models/{dataset_name}"
+    # Generate output directory
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(output_dir or "models", timestamp)
+    if kfold_config and kfold_config.get('enabled', False) and fold_idx is not None:
+        print(f"\nTraining fold {fold_idx+1}/{kfold_config.get('k', 5)}")
+        output_dir = os.path.join(output_dir, f"fold_{fold_idx+1}")
+    print(f"\nNumber of classes: {num_classes}")
     
     # Initialize model and processor
     processor = ViTImageProcessor.from_pretrained(model_name)
@@ -198,17 +59,11 @@ def train_model(split_data, yaml_content, model_name="google/vit-base-patch16-22
         ignore_mismatched_sizes=True
     )
     
-    # Create datasets
-    train_dataset = ImageClassificationDataset(
-        split_data['train']['image_paths'],
-        split_data['train']['labels'],
-        processor
-    )
-    val_dataset = ImageClassificationDataset(
-        split_data['val']['image_paths'],
-        split_data['val']['labels'],
-        processor
-    )
+    # Initialize datasets with processor
+    train_dataset = dataset_info['train_dataset']
+    val_dataset = dataset_info['val_dataset']
+    train_dataset.transform = processor
+    val_dataset.transform = processor
     
     # Setup training arguments
     training_args = TrainingArguments(
@@ -216,21 +71,84 @@ def train_model(split_data, yaml_content, model_name="google/vit-base-patch16-22
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
-        eval_strategy="steps",
-        eval_steps=100,
-        save_strategy="steps",
-        save_steps=100,
+        eval_strategy="epoch",
+        save_strategy="epoch",
         learning_rate=learning_rate,
         load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
+        metric_for_best_model="auc",
         push_to_hub=False,
         remove_unused_columns=False,
         logging_steps=50,
     )
     
+    # Add early stopping callback
+    early_stopping = EarlyStoppingCallback(
+        early_stopping_patience=patience,
+        early_stopping_threshold=0.0
+    )
+    
     def compute_metrics(eval_pred):
-        predictions = np.argmax(eval_pred.predictions, axis=1)
-        return {"accuracy": (predictions == eval_pred.label_ids).mean()}
+        # Handle tuple output from ViT model
+        logits = eval_pred.predictions[0] if isinstance(eval_pred.predictions, tuple) else eval_pred.predictions
+        labels = eval_pred.label_ids
+
+        # Debug information
+        print("\nDebug Info:")
+        print(f"Logits shape: {logits.shape}")
+        print(f"Number of actual classes: {num_classes}")
+        
+        # Ensure logits match the actual number of classes
+        if logits.shape[1] != num_classes:
+            print(f"Warning: Logits dimension ({logits.shape[1]}) does not match number of classes ({num_classes})")
+            # Only use the first num_classes logits
+            logits = logits[:, :num_classes]
+            print(f"Truncated logits shape: {logits.shape}")
+        print(f"Labels shape: {labels.shape}")
+        print(f"Labels dtype: {labels.dtype}")
+        print(f"Unique labels: {np.unique(labels)}")
+        
+        # Apply softmax with numerical stability
+        logits = logits - np.max(logits, axis=1, keepdims=True)
+        exp_logits = np.exp(logits)
+        probas = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+        
+        # Calculate predictions and accuracy
+        predictions = np.argmax(probas, axis=1)
+        predictions = predictions.astype(labels.dtype)  # Ensure same dtype as labels
+        accuracy = np.mean(predictions == labels)
+        
+        print(f"Predictions shape: {predictions.shape}")
+        print(f"Predictions dtype: {predictions.dtype}")
+        print(f"Unique predictions: {np.unique(predictions)}")
+        print(f"Match count: {np.sum(predictions == labels)} out of {len(labels)}")
+        
+        # Convert labels to one-hot format
+        n_classes = logits.shape[1]
+        labels_one_hot = np.zeros((len(labels), n_classes))
+        labels_one_hot[np.arange(len(labels)), labels] = 1
+        
+        # Calculate AUC for each class
+        auc_scores = []
+        for i in range(n_classes):
+            try:
+                # For classes with no samples, assign AUC of 0.5 (random chance)
+                if len(np.unique(labels_one_hot[:, i])) <= 1:
+                    auc_scores.append(0.5)
+                else:
+                    auc = roc_auc_score(labels_one_hot[:, i], probas[:, i])
+                    auc_scores.append(auc)
+            except ValueError as e:
+                print(f"Warning: Could not calculate AUC for class {i}: {e}")
+                # If calculation fails, treat as random chance
+                auc_scores.append(0.5)
+        
+        # Calculate macro average AUC across all classes
+        macro_auc = np.mean(auc_scores)
+        
+        return {
+            "accuracy": accuracy,
+            "auc": macro_auc
+        }
     
     # Initialize trainer
     trainer = Trainer(
@@ -239,10 +157,11 @@ def train_model(split_data, yaml_content, model_name="google/vit-base-patch16-22
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
+        callbacks=[early_stopping],
     )
     
     # Train the model
-    print("\nStarting training...")
+    print(f"\nStarting training for {num_epochs} epochs...")
     trainer.train()
     
     # Save the best model
@@ -250,53 +169,161 @@ def train_model(split_data, yaml_content, model_name="google/vit-base-patch16-22
     trainer.save_model(best_model_path)
     processor.save_pretrained(best_model_path)
     
-    return model, processor
+    # Return metrics from trainer
+    metrics = trainer.evaluate()
+    print(f"Validation metrics: {metrics}")
+    
+    return model, processor, metrics
+
+def load_config(config_path='config.yaml'):
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
 
 def main():
     parser = argparse.ArgumentParser(description='Train image classification model')
-    parser.add_argument('--dataset', type=str, default='birdsnap',
-                      help='Dataset to use (birdsnap, cifar10, cifar100)')
-    parser.add_argument('--model', type=str, default='google/vit-base-patch16-224',
-                      help='Model architecture to use')
-    parser.add_argument('--sample-ratio', type=float, default=1.0,
-                      help='Ratio of dataset to use (0.0 to 1.0)')
-    parser.add_argument('--epochs', type=int, default=100,
-                      help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=32,
-                      help='Batch size for training')
-    parser.add_argument('--learning-rate', type=float, default=2e-5,
-                      help='Learning rate for training')
-    parser.add_argument('--seed', type=int, default=42,
-                      help='Random seed for reproducibility')
-    parser.add_argument('--output-dir', type=str, default=None,
-                      help='Output directory for saving models')
+    parser.add_argument('--config', type=str, default='config.yaml',
+                      help='Path to configuration file')
+    parser.add_argument('--dataset', type=str, default=None,
+                      help='Override dataset name from config')
+    parser.add_argument('--model', type=str, default=None,
+                      help='Override model from config')
+    parser.add_argument('--sample-ratio', type=float, default=None,
+                      help='Override sample ratio from config')
+    parser.add_argument('--kfold', action='store_true',
+                      help='Enable k-fold cross validation (overrides config)')
+    parser.add_argument('--no-kfold', action='store_true',
+                      help='Disable k-fold cross validation (overrides config)')
+    parser.add_argument('--patience', type=int, default=3,
+                      help='Number of evaluations with no improvement after which training will be stopped')
     
     args = parser.parse_args()
     
+    # Load config
+    config = load_config(args.config)
+    
+    # Override config with command line arguments if provided
+    dataset_name = args.dataset or config['dataset']['name']
+    model_name = args.model or config['model']['name']
+    sample_ratio = args.sample_ratio if args.sample_ratio is not None else float(config['dataset']['sample_ratio'])
+    output_dir = config['model']['output_dir']
+    train_ratio = float(config['dataset']['train_ratio'])
+    val_ratio = float(config['dataset']['val_ratio'])
+    base_dir = config['dataset']['base_dir']
+    num_epochs = int(config['training']['num_epochs'])
+    batch_size = int(config['training']['batch_size'])
+    learning_rate = float(config['training']['learning_rate'])
+    seed = int(config['training']['seed']) 
+    patience = args.patience
+    
+    # K-fold settings
+    kfold_config = config['kfold'].copy()  # Make a copy to avoid modifying original
+    # Convert numeric parameters
+    if 'k' in kfold_config:
+        kfold_config['k'] = int(kfold_config['k'])
+    # Command line arguments override config
+    if args.kfold:
+        kfold_config['enabled'] = True
+    elif args.no_kfold:
+        kfold_config['enabled'] = False
+        
     # Set random seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     
     # Prepare dataset
-    print(f"Preparing {args.dataset} dataset with sample ratio {args.sample_ratio}...")
-    yaml_content, split_data = setup_dataset(args.dataset, sample_ratio=args.sample_ratio)
+    print(f"Preparing {dataset_name} dataset with sample ratio {sample_ratio}...")
+    print(f"{'K-fold cross validation enabled' if kfold_config['enabled'] else 'Standard training'}")
     
-    # Print dataset sizes
-    for split in split_data:
-        print(f"Number of samples in {split} set: {len(split_data[split]['image_paths'])}")
-    
-    # Train model
-    model, processor = train_model(
-        split_data,
-        yaml_content,
-        model_name=args.model,
-        num_epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        output_dir=args.output_dir
+    # Load or prepare dataset
+    # Load dataset
+    dataset_info = load_dataset(
+        dataset_name,
+        base_dir=base_dir,
+        transform=None,  # transformations are handled in training class
+        kfold_config=kfold_config
     )
     
-    print(f"\nTraining completed! Model saved in {args.output_dir or f'models/{args.dataset}'}/best/")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Train model based on k-fold setting
+    if kfold_config['enabled']:
+        print(f"\nStarting {kfold_config['k']}-fold cross validation training...")
+        
+        # For storing metrics across folds
+        all_metrics = []
+        best_fold = 0
+        best_accuracy = 0
+        best_auc = 0
+        
+        for fold_idx in range(kfold_config['k']):
+            # Get dataset for current fold
+            fold_dataset_info = load_dataset(
+                dataset_name,
+                base_dir=base_dir,
+                transform=None,
+                kfold_config={**kfold_config, 'fold': fold_idx}
+            )
+            
+            # Train model for this fold
+            model, processor, metrics = train_model(
+                fold_dataset_info,
+                model_name=model_name,
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                output_dir=output_dir,
+                kfold_config=kfold_config,
+                fold_idx=fold_idx,
+                patience=patience
+            )
+            
+            all_metrics.append(metrics)
+            
+            # Track best fold (using AUC as primary metric)
+            if metrics['eval_auc'] > best_auc:
+                best_accuracy = metrics['eval_accuracy']
+                best_auc = metrics['eval_auc']
+                best_fold = fold_idx
+        
+        # Compute average metrics across folds
+        avg_accuracy = np.mean([m['eval_accuracy'] for m in all_metrics])
+        avg_auc = np.mean([m['eval_auc'] for m in all_metrics])
+        
+        print(f"\nK-fold cross validation completed!")
+        print(f"Average metrics across {kfold_config['k']} folds:")
+        print(f"  Accuracy: {avg_accuracy:.4f}")
+        print(f"  AUC: {avg_auc:.4f}")
+        print(f"Best fold: {best_fold+1}")
+        print(f"  Accuracy: {best_accuracy:.4f}")
+        print(f"  AUC: {best_auc:.4f}")
+        print(f"Models saved in {output_dir or f'models/{dataset_name}'}/kfold_{timestamp}/")
+        
+        # If not saving all folds, remove the non-best folds
+        if not kfold_config['save_all_folds']:
+            best_fold_dir = f"{output_dir or f'models/{dataset_name}'}/kfold_{timestamp}/fold_{best_fold+1}"
+            for i in range(kfold_config['k']):
+                if i != best_fold:
+                    fold_dir = f"{output_dir or f'models/{dataset_name}'}/kfold_{timestamp}/fold_{i+1}"
+                    if os.path.exists(fold_dir):
+                        shutil.rmtree(fold_dir)
+    else:
+        # Standard training
+        model, processor, metrics = train_model(
+            dataset_info,
+            model_name=model_name,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            output_dir=output_dir,
+            patience=patience
+        )
+        
+        print(f"\nTraining completed! Model saved in {output_dir or f'models/{dataset_name}'}/{timestamp}/best/")
+        print(f"Validation metrics:")
+        print(f"  Accuracy: {metrics['eval_accuracy']:.4f}")
+        print(f"  AUC: {metrics['eval_auc']:.4f}")
 
 if __name__ == "__main__":
-    main() 
+    main()

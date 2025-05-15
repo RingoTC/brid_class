@@ -1,0 +1,27 @@
+# Training configuration file
+
+# Dataset settings
+dataset:
+  name: birdsnap  # Options: birdsnap, cifar10, cifar100
+  base_dir: datasets
+  train_ratio: 0.7
+  val_ratio: 0.15
+  sample_ratio: 1.0
+
+# Model settings
+model:
+  name: google/vit-base-patch16-224
+  output_dir: null  # If null, will be set to models/{dataset_name}
+
+# Training settings
+training:
+  num_epochs: 100
+  batch_size: 32
+  learning_rate: 0.01
+  seed: 42
+  
+# K-fold cross-validation settings
+kfold:
+  enabled: false
+  k: 5  # Number of folds
+  save_all_folds: false  # Whether to save models from all folds

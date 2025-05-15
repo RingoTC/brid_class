@@ -118,15 +118,22 @@ class BirdClassifierWindow(QMainWindow):
             print("Warning: No models were loaded successfully")
         
     def setup_class_names(self):
-        """Load class names for different models"""
-        from dataset_utils import get_dataset_labels
+        """Load class names and label mappings from dataset.yaml files"""
+        from dataset_utils import get_dataset_info
         
         self.class_names = {}
+        self.label_mappings = {}
+        
         for model_name in self.models.keys():
-            labels = get_dataset_labels(model_name)
-            if labels:
-                self.class_names[model_name] = labels
-                print(f"Loaded {len(labels)} class names for {model_name}")
+            dataset_info = get_dataset_info(model_name, "datasets")
+            if dataset_info and 'names' in dataset_info:
+                self.class_names[model_name] = dataset_info['names']
+                if 'label_mapping' in dataset_info:
+                    # Store the reverse mapping (number -> original label)
+                    self.label_mappings[model_name] = {
+                        v: k for k, v in dataset_info['label_mapping'].items()
+                    }
+                print(f"Loaded {len(self.class_names[model_name])} class names for {model_name}")
             else:
                 print(f"Warning: Could not load class names for {model_name}")
             
@@ -252,8 +259,14 @@ class BirdClassifierWindow(QMainWindow):
         # Format results
         results_text = f"{display_name} Model Predictions:\n\n"
         for idx, prob in predictions:
+            # Get class name using numeric index
             class_name = self.class_names[model_name][idx]
-            results_text += f"{class_name}: {prob*100:.1f}%\n"
+            # If label mapping exists and the model uses string labels, get original label
+            if model_name in self.label_mappings and idx in self.label_mappings[model_name]:
+                display_name = self.label_mappings[model_name][idx]
+            else:
+                display_name = class_name
+            results_text += f"{display_name}: {prob*100:.1f}%\n"
         
         # Update UI
         self.results_label.setText(results_text)
@@ -284,4 +297,4 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == '__main__':
-    main() 
+    main()
